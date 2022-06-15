@@ -1,0 +1,3234 @@
+create or replace package body FTS
+/****
+ FTS package for Zimbabwe Pension Agency's File Tracking System
+ Written by Avi Coren
+ */
+is
+
+v_registry_sec     varchar2(20) := '022324';
+
+----------------------------- Private procedures ------------------------
+
+/*  procedure handle_queue DOES NOT commit or rollback. 
+    the calling procedure or function will do
+    the commit or rollback according to the exit code of handle_queue
+*/
+procedure handle_queue (p_pf_type   in  varchar2,
+                        p_pf_body   in  varchar2,
+                        p_now       in  date,
+                        p_exit_code out number) is
+
+    v_from_u_q          varchar2(50);
+    v_from_s_q          varchar2(50);
+    v_req_remark_q      varchar2(500);
+    v_status            varchar2(50);
+    v_from_u            varchar2(50);
+    v_from_s            varchar2(50);
+    v_to_u              varchar2(50);
+    v_to_s              varchar2(50);
+    v_officer           varchar2(50);
+    v_section           varchar2(50);
+    v_act_time_q        date;
+    v_since             date;
+    v_exit_code         number;
+
+begin
+
+    select  FROM_USER,   -- find the earliest record in FTS_REQ_QUEUE
+            FROM_SECT,
+            ACT_TIME,
+            REQ_REMARK
+      into  v_from_u_q,
+            v_from_s_q,
+            v_act_time_q,
+            v_req_remark_q
+      from  FTS_REQ_QUEUE
+     where  PF_TYPE = p_pf_type
+       and  PF_BODY = p_pf_body
+       and  ACT_TIME = (select MIN(ACT_TIME)
+                          from FTS_REQ_QUEUE
+                         where PF_TYPE = p_pf_type
+                           and PF_BODY = p_pf_body);
+
+
+    begin
+
+         select TRANS_STATUS,  -- find the latest 'O', 'I' record in FTS_REQUESTS
+                FROM_USER,
+                FROM_SECT,
+                TO_USER,
+                TO_SECT
+           into v_status,
+                v_from_u,
+                v_from_s,
+                v_to_u,
+                v_to_s
+           from FTS_REQUESTS
+          where PF_TYPE = p_pf_type
+            and PF_BODY = p_pf_body
+            and ACT_TIME = (select MAX(ACT_TIME)
+                              from FTS_REQUESTS
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body
+                               and TRANS_STATUS in ('I','O'));
+
+        case
+            when v_status = 'O' then
+
+                Get_File_Location ( p_pf_type, p_pf_body, v_officer, v_section, v_since, v_exit_code);
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, p_now, 'N',v_from_u_q, v_from_s_q, v_officer , v_section, v_req_remark_q, v_from_u_q);
+
+                insert
+                  into FTS_REQ_QUEUE_HIST
+                       (PF_TYPE,PF_BODY,START_TIME,FROM_USER,FROM_SECT,REQ_REMARK,END_TIME)
+                values (p_pf_type, p_pf_body, v_act_time_q, v_from_u_q, v_from_s_q, v_req_remark_q, p_now);
+
+                delete
+                  from FTS_REQ_QUEUE
+                 where PF_TYPE   = p_pf_type
+                   and PF_BODY   = p_pf_body
+                   and FROM_USER = v_from_u_q;
+
+                p_exit_code := 0;
+
+            when v_status = 'I' then
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, p_now, 'N',v_from_u_q, v_from_s_q, NULL , v_registry_sec, v_req_remark_q, v_from_u_q);
+
+                insert
+                  into FTS_REQ_QUEUE_HIST
+                       (PF_TYPE,PF_BODY,START_TIME,FROM_USER,FROM_SECT,REQ_REMARK,END_TIME)
+                values (p_pf_type, p_pf_body, v_act_time_q, v_from_u_q, v_from_s_q, v_req_remark_q, p_now);
+
+                delete
+                  from FTS_REQ_QUEUE
+                 where PF_TYPE   = p_pf_type
+                   and PF_BODY   = p_pf_body
+                   and FROM_USER = v_from_u_q;
+
+                p_exit_code := 0;
+
+        end case;
+
+    exception
+
+        when no_data_found then -- no 'O' or 'I' records in FTS_REQUESTS for that file
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, p_now, 'N',v_from_u_q, v_from_s_q, NULL , v_registry_sec, v_req_remark_q, v_from_u_q);
+
+                insert
+                  into FTS_REQ_QUEUE_HIST
+                       (PF_TYPE,PF_BODY,START_TIME,FROM_USER,FROM_SECT,REQ_REMARK,END_TIME)
+                values (p_pf_type, p_pf_body, v_act_time_q, v_from_u_q, v_from_s_q, v_req_remark_q, p_now);
+
+                delete
+                  from FTS_REQ_QUEUE
+                 where PF_TYPE   = p_pf_type
+                   and PF_BODY   = p_pf_body
+                   and FROM_USER = v_from_u_q;
+
+                p_exit_code := 0;
+
+        when others then
+
+            p_exit_code := 201;
+			PENSION.DEBUG('FTS.handle_queue 201'||SQLERRM);
+
+    end;
+
+exception
+
+    when no_data_found then -- no records in FTS_REQ_QUEUE
+
+        p_exit_code := 202;
+
+    when others then
+
+        p_exit_code := 203;
+		PENSION.DEBUG('FTS.handle_queue 203'||SQLERRM);
+
+end handle_queue;
+----------------------------------------------------------------------------
+
+------------------------------ Get_Err_Msg  --------------------
+/*
+p_line values:
+0 - message title
+1 - first line
+2 - second line
+10 - Message type (stop,caution,note)
+message title and first line are stored in PRE_DESC column (GLB_PROGRAM_ERROR table) and are seperated by '~!~'
+second line is stored in PRE_MEASURES column
+*/
+function Get_Err_Msg    (p_code  in  varchar2,
+                         p_line	 in	 number )
+return varchar2 is
+
+    v_msg	varchar2(2000);
+    v_type  varchar2(1);
+
+begin
+
+    case p_line
+
+        when 0 then
+            select substr(PRE_DESC,1,instr(PRE_DESC,'~!~',1)-1)
+              into v_msg
+              from GLB_PROGRAM_ERROR
+             where PRE_CODE = p_code;
+        when 1 then
+            select substr(PRE_DESC,instr(PRE_DESC,'~!~',1)+3)
+              into v_msg
+              from GLB_PROGRAM_ERROR
+             where PRE_CODE = p_code;
+        when 2 then
+            select PRE_MEASURES
+              into v_msg
+              from GLB_PROGRAM_ERROR
+             where PRE_CODE = p_code;
+
+        when 10 then
+            select PRE_TYPE
+              into v_type
+              from GLB_PROGRAM_ERROR
+             where PRE_CODE = p_code;
+
+             case v_type
+                when 'E' then v_msg := 'STOP';
+                when 'I' then v_msg := 'NOTE';
+                when 'C' then v_msg := 'CAUTION';
+             end case;
+
+    end case;
+
+    return v_msg;
+
+exception
+
+    when no_data_found then
+
+        return '*** NO MESSAGE FOUND ***';
+
+    when others then
+
+        return '*** ERROR IN {Get_Err_Msg} ***';
+
+end;
+
+
+------------------------------ Get_parameter  --------------------
+function Get_parameter  (p_parameter  in  varchar2)
+return varchar2 is
+
+    v_value     varchar2(200);
+
+begin
+
+    select VALUE1
+      into v_value
+      from FTS_PARAM
+     where PARAM1 =  p_parameter;
+
+    if v_value is null then 
+        return null;
+    else 
+        return v_value;
+    end if;
+
+exception
+
+    when no_data_found then
+
+        return null;
+
+end Get_parameter;
+
+
+------------------------------ Get_Days_Limit  --------------------
+function    Get_Days_Limit (p_pf_type  in  varchar2)
+return number is
+
+    v_days      number;
+
+begin
+    select DAYS_LIMIT
+      into v_days
+      from REF_FTS_TYPES
+     where PF_TYPE = p_pf_type;
+     
+    return v_days;
+
+exception
+
+    when no_data_found then
+    
+        return null;
+
+end Get_Days_Limit;
+
+
+------------------------------ Is_Deceased  --------------------
+/*
+ * Is_Deceased function
+ * return values:
+ * 0 - person is alive, or person is in PER_DETAILS and not yet in PER_PERSON
+ * 1 - person is deceased
+ * 2 - Record not found
+ * 3 - Unknown error
+ */
+function Is_Deceased (p_per_id  in varchar2 := null)
+return number is
+
+    v_chk   date;
+
+begin
+    select  PER_DOD
+      into  v_chk
+      from  PER_PERSON
+     where  PER_ID  = p_per_id;
+
+    if v_chk is null then
+         return 0;
+    else return 1;
+
+    end if;
+
+exception
+
+    when no_data_found then
+        
+        begin
+
+            select  PER_DOD
+              into  v_chk
+              from  PER_PERSON_INCOMPLETE
+             where  PER_ID  = p_per_id;
+        
+            if v_chk is null then
+                 return 0;
+            else return 1;
+        
+            end if;
+        
+        exception
+        
+            when no_data_found then
+                
+                begin
+
+                    select  PER_FIM_CDATE
+                      into  v_chk
+                      from  PER_DETAILS
+                     where  PER_FIM_ID  = p_per_id;
+                
+                    return 0;
+                
+                exception
+                
+                    when no_data_found then
+                        return 2;
+                    
+                    when others then
+                        return 3;
+                
+                end;
+            
+            when others then
+                return 3;
+        
+        end;
+    
+    when others then
+        return 3;
+
+end Is_Deceased;
+
+------------------------------ Is_Foreign  --------------------
+/*
+ * Is_Foreign function
+ * return values:
+ * 0 - person is NOT a Foreign Pensioner
+ * 1 - person is a Foreign Pensioner
+ * 2 - person is a Foreign Pensioner from payable country (South Africa)
+ * 3 - Record not found
+ * 4 - Unknown error
+ */
+function Is_Foreign (p_per_id  in varchar2 := null)
+return number is
+
+    v_cty_code   varchar2(10);
+
+begin
+    select  PER_CTY_CODE
+      into  v_cty_code
+      from  PER_PERSON
+     where  PER_ID  = p_per_id;
+
+    if v_cty_code not like '%ZIM%' then
+         if v_cty_code like 'SA%' then
+            return 2;
+         else
+            return 1;
+         end if;
+    else return 0;
+
+    end if;
+
+exception
+
+    when no_data_found then
+        
+        begin
+        
+            select  PER_CTY_CODE
+              into  v_cty_code
+              from  PER_PERSON_INCOMPLETE
+             where  PER_ID  = p_per_id;
+        
+            if v_cty_code not like '%ZIM%' then
+                 if v_cty_code like 'SA%' then
+                    return 2;
+                 else
+                    return 1;
+                 end if;
+            else return 0;
+        
+            end if;
+        
+        exception
+        
+            when no_data_found then
+                return 3;
+                
+            when others then
+                return 4;     
+                
+        end;
+        
+    when others then
+        return 4;
+        
+end Is_Foreign;
+
+------------------------------ Get_PF_Body  --------------------
+function Get_PF_Body (p_pf_no in varchar2)
+return varchar2 is
+
+    l_pf_body     varchar2(10);
+
+begin
+
+    if instr(p_pf_no,'-') < 5
+    or instr(p_pf_no,'-') > 8 then
+        return null;
+    end if;
+
+    l_pf_body := substr(p_pf_no,instr(p_pf_no,'-')+1);
+    return l_pf_body;
+
+end Get_PF_Body;
+
+------------------------------ Get_PF_No ------------------------
+function Get_PF_No   (p_pf_type in varchar2,
+                      p_pf_body in varchar2)
+return varchar2 is
+
+    l_pf_no     varchar2(30);
+
+begin
+
+    l_pf_no := p_pf_type || '-' || p_pf_body;
+    return l_pf_no;
+
+end Get_PF_No;
+
+------------------------------ PF_Num_Exist ------------------------
+function    PF_Num_Exist  (p_pf_type in varchar2,
+                          p_pf_body in varchar2)
+return boolean is
+
+    v_pf_type   varchar2(20);
+
+begin
+
+    select  PF_TYPE
+      into  v_pf_type
+      from  FTS_MASTER
+     where  PF_TYPE = p_pf_type
+       and  PF_BODY = p_pf_body;
+
+    return true;
+
+exception
+
+    when no_data_found then
+
+        return false;
+
+end PF_Num_Exist;
+
+
+
+------------------------------ Get_PF_status  ----------------
+function Get_PF_status  ( p_pf_type in varchar2,
+                          p_pf_body in varchar2)
+return varchar2 is
+
+    v_status   REF_FTS_FILE_STATUS.PF_STATUS_DESC%TYPE;
+
+begin
+
+    select RST.PF_STATUS_DESC
+      into v_status
+      from FTS_STATUS ST,
+           REF_FTS_FILE_STATUS RST
+     where ST.PF_TYPE = p_pf_type
+       and ST.PF_BODY = p_pf_body
+       and ST.AMEND_TIME = (select max(AMEND_TIME)
+                              from FTS_STATUS
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body)
+       and RST.PF_STATUS = ST.PF_STATUS;
+
+    return v_status ;
+
+exception
+
+    when no_data_found then
+        v_status := null;
+        return v_status ;
+
+end Get_PF_status;
+
+------------------------------ Get_PF_Type  -------------
+function Get_PF_Type (p_pf_no in varchar2)
+return varchar2 is
+
+    l_pf_type     varchar2(10);
+
+begin
+
+    if instr(p_pf_no,'-') < 5
+    or instr(p_pf_no,'-') > 8 then
+        return null;
+    end if;
+
+    l_pf_type := substr(p_pf_no,1,instr(p_pf_no,'-')-1);
+    return l_pf_type;
+
+end Get_PF_Type;
+
+------------------------------ Get_File_No -----------------
+		FUNCTION GET_FILE_NO ( 
+	P_PF_TYPE IN VARCHAR2,
+	P_PER_ID  IN VARCHAR2,
+	P_TABLE_NAME IN VARCHAR2,
+	P_MODE IN VARCHAR2 DEFAULT NULL)
+	RETURN VARCHAR2 IS
+		V_FILENO      VARCHAR2(500);
+		V_FILENO_TXT  VARCHAR2(20);
+		STMT          VARCHAR2(500);
+	BEGIN
+		IF P_MODE IS NULL AND (
+			(P_PF_TYPE IS NULL OR P_PER_ID IS NULL OR P_TABLE_NAME NOT IN ('PER_PERSON', 'PER_PERSON_INCOMPLETE'))
+			OR
+			(P_PF_TYPE IN ('PFPD', 'PFPDWG') AND P_TABLE_NAME = 'PER_PERSON_INCOMPLETE') -- BECAUSE PER_PDFNO COLUMN DOES NOT EXIST IN PER_PERSON_INCOMPLETE
+			)
+		THEN
+			V_FILENO := NULL;
+		ELSIF P_MODE IS NULL THEN
+			CASE P_PF_TYPE
+				WHEN 'PFSP'    THEN V_FILENO_TXT := 'PER_SPFNO';
+				WHEN 'PFSPWG'  THEN V_FILENO_TXT := 'PER_SPFNO';
+				WHEN 'PFPD'    THEN V_FILENO_TXT := 'PER_PDFNO';
+				WHEN 'PFPDWG'  THEN V_FILENO_TXT := 'PER_PDFNO';
+				WHEN 'PFVT'    THEN V_FILENO_TXT := 'PER_VTFNO';
+				WHEN 'PFVTWG'  THEN V_FILENO_TXT := 'PER_VTFNO';
+				WHEN 'PFWV'    THEN V_FILENO_TXT := 'PER_WVFNO';
+				WHEN 'PFWVWG'  THEN V_FILENO_TXT := 'PER_WVFNO';
+				WHEN 'PFIOD'   THEN V_FILENO_TXT := 'PER_IDFNO';
+				WHEN 'PFIODWG' THEN V_FILENO_TXT := 'PER_IDFNO';
+				WHEN 'PFNHWG'  THEN V_FILENO_TXT := 'PER_HERONO';
+				ELSE
+					V_FILENO := NULL;
+					RETURN V_FILENO;
+			END CASE;
+			BEGIN
+				STMT := 'SELECT ' || V_FILENO_TXT || ' FROM '||P_TABLE_NAME||' WHERE PER_ID= ''' || P_PER_ID|| '''';
+				EXECUTE IMMEDIATE STMT
+				INTO V_FILENO;
+			EXCEPTION WHEN OTHERS THEN 
+				IF SQLCODE='-933' THEN 
+					STMT := 'SELECT ' || V_FILENO_TXT || ' FROM '||P_TABLE_NAME||' WHERE REPLACE(PER_ID,'''''''',''-'')= ''' || REPLACE(P_PER_ID,'''','-')  || '''';
+					EXECUTE IMMEDIATE STMT
+					INTO V_FILENO;
+				END IF;
+			END;
+		ELSIF P_MODE = 'FTS' THEN
+			FOR REC IN (
+				SELECT PF_TYPE||'-'||PF_BODY  "PF_FULL"
+				FROM FTS_MASTER WHERE 
+				PER_ID=P_PER_ID)
+			LOOP
+				CASE 
+					WHEN V_FILENO IS NULL THEN V_FILENO:=REC.PF_FULL;
+					ELSE V_FILENO := V_FILENO||';'||REC.PF_FULL;
+				END CASE;
+			END LOOP;
+		END IF;
+		RETURN V_FILENO;
+	EXCEPTION
+		WHEN NO_DATA_FOUND THEN
+			RETURN NULL ;
+		WHEN OTHERS THEN PENSION.DEBUG('FTS.GET_FILE_NO '||SQLERRM);
+	END GET_FILE_NO;
+------------------------------ Get_File_Location --------------------
+/*
+ * exit codes:
+ * 0 -
+ * 1 - the file does not exist in FTS_MASTER
+ */
+
+
+procedure Get_File_Location (p_pf_type    in  varchar2,
+                             p_pf_body    in  varchar2,
+                             p_officer    out varchar2,
+                             p_section    out varchar2,
+                             p_since      out date,
+                             exit_code    out number  ) is
+
+begin
+
+    if not PF_Num_Exist( p_pf_type, p_pf_body ) then
+        exit_code := 1;
+        return;
+    end if;
+
+
+    begin -- retreive the username,section,function of officer currently holding the file
+        select OFCR_RCVD,
+               SECT_RCVD,
+               RCVD_TIME
+          into p_officer,
+               p_section,
+               p_since
+          from FTS_TRANS
+         where PF_TYPE = p_pf_type
+           and PF_BODY = p_pf_body
+           and RCVD_TIME = (select max(RCVD_TIME)
+                              from FTS_TRANS
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body);
+
+         if p_section = v_registry_sec then
+
+             p_officer    := NULL;
+             p_since      := NULL;
+             return;
+
+         end if;
+
+
+    exception
+
+        when no_data_found then   -- if not found in FTS_TRANS table then the file is in Registry
+            p_section    := v_registry_sec;
+            p_officer    := NULL;
+            p_since      := NULL;
+            return;
+
+    end;
+
+end Get_File_Location ;
+
+------------------------------ Get_Pay_Period --------------------
+function Get_Pay_Period (p_per_id in varchar2)
+return date is
+
+    p_payperiod     date;
+
+begin
+
+        select to_date(min(BEN_PAYPERIOD),'YYYYMM')
+          into p_payperiod
+          from CLM_BENEF
+         where BEN_DEP_PER_ID = p_per_id
+           and BEN_CLM_NO like 'SP%';
+
+        return p_payperiod;
+
+exception
+
+        when no_data_found then
+            p_payperiod := null;
+            return p_payperiod;
+
+
+end Get_Pay_Period;
+
+
+------------------------------ Get_User_Section --------------------
+function Get_User_Section (p_username in varchar2)
+return varchar2 is
+
+    v_sec_code varchar2(10);
+
+begin
+
+    select SEC_CODE
+      into v_sec_code
+      from USERS
+     where USERNAME = p_username;
+
+    return v_sec_code;
+
+exception
+
+    when others then
+        return null;
+
+end Get_User_Section;
+
+------------------------------ Get_User_Function --------------------
+function Get_User_Function (p_username in varchar2)
+return varchar2 is
+
+    v_grade number := 0;
+
+begin
+
+    for rec in  (select USA_FTN_CODE
+                   from REF_USERACCESS
+                  where USA_OFF_CODE = p_username
+                    and upper(USA_FTN_CODE) not like 'M_ALL'
+                    and upper(USA_FTN_CODE) like 'M_%')
+    loop
+
+        case upper(rec.USA_FTN_CODE)
+
+            when 'M_OFCR' then
+                if v_grade < 1 then v_grade := 1; end if;
+            when 'M_TLDR' then
+                if v_grade <= 1 then v_grade := 2; end if;
+            when 'M_MNGR' then
+                if v_grade <= 2 then v_grade := 3; end if;
+            else null;
+
+        end case;
+
+    end loop;
+
+    case v_grade
+
+            when 1 then
+                return 'M_OFCR';
+            when 2 then
+                return 'M_TLDR';
+            when 3 then
+                return 'M_MNGR';
+            else return null;
+
+    end case;
+
+end Get_User_Function;
+
+------------------------------ Get_User_Name --------------------
+procedure Get_User_Name    ( p_username  in  varchar2,
+                             p_fname     out varchar2,
+                             p_sname     out varchar2) is
+
+begin
+
+    select FORENAME,
+           SURNAME
+      into p_fname,
+           p_sname
+      from USERS
+     where p_username = USERNAME;
+     
+     p_fname := NVL( p_fname, '????');
+     p_sname := NVL( p_sname, '????');
+
+exception
+
+    when no_data_found then
+        p_fname := null;
+        p_sname := null;
+
+end Get_User_Name;
+
+------------------------------ Get_Section_Name --------------------
+function Get_Section_Name (p_sec_code in varchar2)
+return varchar2 is
+
+    p_section   varchar2(20);
+
+begin
+
+    select SEC_DESC
+      into p_section
+      from REF_SECTION
+     where SEC_CODE = p_sec_code;
+
+    return p_section;
+    
+exception
+
+    when no_data_found then
+        
+        return null;
+
+end Get_Section_Name;
+
+
+------------------------------ Get_Section_Code --------------------
+function Get_Section_Code (p_sec_name in varchar2)
+return varchar2 is
+
+    p_section   varchar2(50);
+
+begin
+
+    select SEC_CODE
+      into p_section
+      from REF_SECTION
+     where SEC_DESC = p_sec_name;
+
+    return p_section;
+    
+exception
+
+    when no_data_found then
+        
+        return null;
+      
+end Get_Section_Code;
+
+
+------------------------------ Get_Per_ID --------------------
+function Get_Per_ID (p_pf_type in varchar2,
+                     p_pf_body in varchar2)
+return varchar2 is
+
+    v_per_id varchar2(20);
+
+begin
+    select PER_ID
+      into v_per_id
+      from FTS_MASTER
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body;
+
+     return v_per_id;
+
+exception
+
+    when no_data_found then
+        return null;
+
+end Get_Per_ID;
+
+------------------------------ Get_PF_Desc --------------------
+function Get_PF_Desc (p_pf_type in varchar2)
+return varchar2 is
+
+    v_desc varchar2(300);
+
+begin
+    select PF_DESC
+      into v_desc
+      from REF_FTS_TYPES
+     where PF_TYPE = p_pf_type;
+
+     return v_desc;
+
+exception
+
+    when no_data_found then
+        return null;
+
+end Get_PF_Desc;
+
+------------------------------ NID2PID --------------------
+function NID2PID   (p_per_nid in varchar2)
+return varchar2 is
+
+    v_per_id    varchar2(50);
+
+begin
+
+    select PER_ID
+      into v_per_id
+      from PER_PERSON
+     where PER_NID = p_per_nid;
+
+    return v_per_id;
+
+exception
+    when no_data_found then
+
+        begin
+
+            select PER_ID
+              into v_per_id
+              from PER_PERSON_INCOMPLETE
+             where PER_NID = p_per_nid;
+
+            return v_per_id;
+
+        exception
+
+            when no_data_found then
+            
+                begin
+
+                    select PER_FIM_ID
+                      into v_per_id
+                      from PER_DETAILS
+                     where PER_FIM_NID = p_per_nid;
+        
+                    return v_per_id;
+        
+                exception
+        
+                    when no_data_found then
+                    return null;
+        
+                end;
+
+        end;
+
+end NID2PID;
+
+------------------------------ PID2NID --------------------
+function PID2NID   (p_per_id in varchar2)
+return varchar2 is
+
+    v_per_nid    varchar2(50);
+
+begin
+
+    select PER_NID
+      into v_per_nid
+      from PER_PERSON
+     where PER_ID = p_per_id;
+
+    return v_per_nid;
+
+exception
+    when no_data_found then
+        begin
+
+            select PER_NID
+              into v_per_nid
+              from PER_PERSON_INCOMPLETE
+             where PER_ID = p_per_id;
+
+             return v_per_nid;
+
+        exception
+            when no_data_found then
+                
+                begin
+
+                    select PER_FIM_NID
+                      into v_per_nid
+                      from PER_DETAILS
+                     where PER_FIM_ID = p_per_id;
+        
+                     return v_per_nid;
+        
+                exception
+                    when no_data_found then
+                        return null;
+                end;
+                
+        end;
+
+
+end PID2NID;
+
+------------------------------ Get_Person_Name --------------------
+procedure Get_Person_Name ( p_per_id  in  varchar2,
+                            p_fname   out varchar2,
+                            p_sname   out varchar2) is
+
+
+begin
+
+    select  PER_FNAME,
+            PER_SURNAME
+      into  p_fname,
+            p_sname
+      from  PER_PERSON
+     where  PER_ID  = p_per_id;
+
+exception
+
+     when no_data_found then
+
+     begin
+
+        select  PER_FNAME,
+                PER_SURNAME
+          into  p_fname,
+                p_sname
+          from  PER_PERSON_INCOMPLETE
+         where  PER_ID  = p_per_id;
+
+     exception
+
+        when no_data_found then
+            
+            begin
+
+                select  PER_FIM_FNAME,
+                        PER_FIM_LNAME
+                  into  p_fname,
+                        p_sname
+                  from  PER_DETAILS
+                 where  PER_FIM_ID  = p_per_id;
+        
+             exception
+        
+                when no_data_found then
+                    p_fname := null;
+                    p_sname := null;
+                    return;
+             end;
+     end;
+
+end Get_Person_Name;
+
+
+------------------------------ PF_Body_Gen --------------------
+function PF_Body_Gen( p_pf_type IN varchar2)
+return varchar2 is
+
+    stmt    varchar2(500);
+    v_num   varchar2(10);
+
+begin
+
+    stmt := 'SELECT TO_CHAR( ' || p_pf_type || '_SEQ.NEXTVAL,''fm0999999999'' ) FROM DUAL';
+
+    execute immediate stmt
+    into    v_num;
+
+    return v_num;
+
+end PF_Body_Gen;
+
+
+------------------------------ PF_Num_Gen --------------------
+/*
+ * Exit codes:
+ * 0 - Generated successfully
+ * 1 - PF number already exists
+ * 2 - Missing parameters
+ * 3 - No matching file number (old format) was found for person
+ * 4 - No privileges for generating PF number
+ * 5 - Person ID does not exist
+*/
+procedure PF_Num_Gen  ( p_pf_type   in  varchar2,
+                        p_per_id    in  varchar2,
+                        p_username  in  varchar2,
+                        p_pf_body   out varchar2,
+                        p_exit_code out number  ) is
+
+v_per_id    varchar2(30);
+
+begin
+
+    if Get_User_Section(p_username) <> v_registry_sec then  -- only officers from Registry can generate PF number
+
+        p_exit_code := 4;
+        return;
+
+    end if;
+
+    if p_pf_type is null
+    or p_per_id  is null then
+
+        p_exit_code := 2;
+        return;
+
+    end if;
+
+    begin  -- check if person ID exists
+
+        select PER_ID
+          into v_per_id
+          from PER_PERSON
+         where PER_ID = p_per_id;
+
+    exception
+
+        when no_data_found then
+
+            begin
+
+                select PER_ID
+                  into v_per_id
+                  from PER_PERSON_INCOMPLETE
+                 where PER_ID = p_per_id;
+
+            exception
+
+                when no_data_found then
+
+                    begin
+
+                        select PER_FIM_ID
+                          into v_per_id
+                          from PER_DETAILS
+                         where PER_FIM_ID = p_per_id;
+        
+                    exception
+        
+                        when no_data_found then
+        
+                            p_exit_code := 5;
+                            return;
+        
+                    end;
+
+            end;
+
+    end;
+
+/****    This check was commented out because we didn't want to force an old file number to exists
+    if  Get_File_No (p_pf_type, p_per_id, 'PER_PERSON') is null
+    and Get_File_No (p_pf_type, p_per_id, 'PER_PERSON_INCOMPLETE') is null
+    and p_pf_type <> 'PFRF' then
+
+        p_exit_code := 3;
+        return;
+
+    end if;
+*/
+
+    lock table FTS_MASTER in exclusive mode; -- lock FTS_MASTER table (in case a record needs to be created)
+
+    begin
+
+        select PF_BODY
+          into p_pf_body
+          from FTS_MASTER
+         where PF_TYPE = p_pf_type
+           and PER_ID = p_per_id;
+
+        if p_pf_body is not null then
+
+            p_exit_code := 1;
+            rollback;
+            return;
+
+        end if;
+
+    exception
+
+        when no_data_found then
+
+            p_pf_body := PF_Body_Gen(p_pf_type);
+
+            --  when there is no record in FTS_MASTER then we assume the file is in Registry. So create a new record in FTS_MASTER and open request with status N
+			insert
+			into FTS_MASTER
+			   (PF_TYPE, PF_BODY, PER_ID,PF_CUSER,PF_CDATE)
+			values (p_pf_type, p_pf_body , p_per_id,USER,SYSDATE);
+
+            insert
+              into FTS_STATUS
+                   (PF_TYPE, PF_BODY, PF_STATUS, AMEND_TIME, AMEND_BY, STATUS_REM)
+            values (p_pf_type, p_pf_body, 'A', sysdate, p_username, null); 
+
+            commit;  
+
+            p_exit_code := 0;
+            return;
+
+        when others then
+            p_exit_code := 101;
+			PENSION.DEBUG('FTS.PF_Num_Gen 101'||SQLERRM);
+            rollback;
+            return;
+    end;
+
+    p_exit_code := 103;
+    rollback;
+    return;
+
+exception
+
+    when others then
+            p_exit_code := 102;
+            rollback;
+            return;
+
+end PF_Num_Gen;
+
+------------------------------ Req_In_Queue --------------------
+function    Req_In_Queue            (p_pf_type   in  varchar2,
+                                     p_pf_body   in  varchar2,
+                                     p_ofcr_req  in  varchar2)
+
+return boolean is
+
+    v_char varchar2(20);
+
+begin
+
+    select FROM_USER
+      into v_char
+      from FTS_REQ_QUEUE
+     where PF_TYPE   = p_pf_type
+       and PF_BODY   = p_pf_body
+       and FROM_USER = p_ofcr_req;
+
+    if v_char is not null then
+        return true;
+    end if;
+
+exception
+
+    when no_data_found then
+        return false;
+
+end Req_In_Queue;
+
+------------------------------ Req_In_Queue_Sec --------------------
+function    Req_In_Queue_Sec        (p_pf_type   in  varchar2,
+                                     p_pf_body   in  varchar2,
+                                     p_sec_code  in  varchar2)
+
+return boolean is
+
+    v_char varchar2(20);
+
+begin
+
+    select FROM_SECT
+      into v_char
+      from FTS_REQ_QUEUE
+     where PF_TYPE   = p_pf_type
+       and PF_BODY   = p_pf_body
+       and FROM_SECT = p_sec_code;
+
+    if v_char is not null then
+        return true;
+    end if;
+
+exception
+
+    when no_data_found then
+        return false;
+
+end Req_In_Queue_Sec;
+
+
+------------------------------ Req_Exist --------------------
+function    Req_Exist               (p_pf_type   in  varchar2,
+                                     p_pf_body   in  varchar2,
+                                     p_ofcr_req  in  varchar2)
+
+return boolean is
+
+    v_char varchar2(20);
+
+begin
+
+        select FROM_USER
+          into v_char
+          from FTS_REQUESTS
+         where PF_TYPE   = p_pf_type
+           and PF_BODY   = p_pf_body
+           and FROM_USER = p_ofcr_req
+           and TRANS_STATUS not in( 'O','I','C')
+           and ACT_TIME = ( select MAX(ACT_TIME)
+                              from FTS_REQUESTS
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body);
+
+        if v_char is not null then
+
+            return true;
+
+        end if;
+
+    exception
+
+        when no_data_found then
+            return false;
+
+end Req_Exist;
+
+------------------------------ Req_Exist_Sec --------------------
+function    Req_Exist_Sec           (p_pf_type   in  varchar2,
+                                     p_pf_body   in  varchar2,
+                                     p_sec_code  in  varchar2)
+
+return boolean is
+
+    v_char varchar2(20);
+
+begin
+
+        select FROM_SECT
+          into v_char
+          from FTS_REQUESTS
+         where PF_TYPE   = p_pf_type
+           and PF_BODY   = p_pf_body
+           and FROM_SECT = p_sec_code
+           and TRANS_STATUS not in( 'O','I','C')
+           and ACT_TIME = ( select MAX(ACT_TIME)
+                              from FTS_REQUESTS
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body);
+
+        if v_char is not null then
+
+            return true;
+
+        end if;
+
+    exception
+
+        when no_data_found then
+            return false;
+
+end Req_Exist_Sec;
+
+------------------------------ Add_Scan_Item --------------------
+/*
+ * Exit codes:
+ * 0 - Added successfuly
+ * 1 - PF number already exists in table
+ * 2 - no such PF number in the system
+ */
+function    Add_Scan_Item           (p_pf_num     in  varchar2,
+                                     p_username   in  varchar2)
+return number is
+v_pf_num     varchar2(20);
+begin
+    
+    if not PF_Num_Exist( Get_PF_Type(p_pf_num), Get_PF_Body(p_pf_num)) then
+
+        return 2;
+
+    end if;
+    
+    select PF_NUMBER
+      into v_pf_num
+      from FTS_SCAN_ITEMS
+     where PF_NUMBER = p_pf_num
+       and USERNAME = p_username;
+     
+     return 1;
+    
+exception
+
+    when no_data_found then
+    
+        INSERT INTO FTS_SCAN_ITEMS (PF_NUMBER,USERNAME,TIME_ADDED)
+        VALUES (p_pf_num,p_username,sysdate);
+
+        commit;
+    
+        return 0;
+
+end Add_Scan_Item;
+
+
+------------------------------ Del_Scan_Item --------------------
+/*
+ * Exit codes:
+ * 0 - Deleted successfuly
+ * 1 - PF number does not exist in table
+ * 
+ */
+function    Del_Scan_Item  (p_pf_num     in  varchar2,
+                            p_username   in  varchar2)
+return number is
+v_pf_num     varchar2(20);
+begin
+
+    select PF_NUMBER
+      into v_pf_num
+      from FTS_SCAN_ITEMS
+     where PF_NUMBER = p_pf_num
+       and USERNAME = p_username;
+
+    DELETE 
+      FROM FTS_SCAN_ITEMS 
+     WHERE PF_NUMBER = v_pf_num
+       AND USERNAME = p_username;
+
+    commit;
+    
+    return 0;
+
+exception
+
+    when no_data_found then
+
+        return 1;
+    
+end Del_Scan_Item;
+
+                                    
+------------------------------ Clr_Scan_Item --------------------
+/*
+ * Exit codes:
+ * 0 - Cleared successfuly
+ * 
+ * 
+ */
+function    Clr_Scan_Item  (p_username   in  varchar2)
+return number is
+
+begin
+
+    DELETE 
+      FROM FTS_SCAN_ITEMS 
+     WHERE USERNAME = p_username;
+
+    commit;
+    
+    return 0;
+
+exception
+
+    when others then
+
+        return sqlcode;
+    
+end Clr_Scan_Item;
+                                    
+                                                                    
+------------------------------ New_Request --------------------
+/*
+ * Exit codes:
+ * 0 - Updated successfuly
+ * 1 - No such PF number (TYPE+BODY)
+ * 2 - Person ID was not found in PER_PERSON but was found in PER_PERSON_INCOMPLETE
+ * 3 - Person ID was not found in PER_PERSON nor in PER_PERSON_INCOMPLETE
+ * 4 - PF number was not found in FTS_MASTER  (wrong PF_BODY was supplied by the user)
+ * 5 - The user already requested this file
+ * 6 - PF number and Person ID do not match in file
+ * 7 - No matching file number (old format) was found for this request
+ * 8 - Missing parameters
+ * 9 - Person ID was found ONLY in PER_DETAILS (it is a new file)
+ */
+procedure New_Request (p_pf_type   in  varchar2,
+                       p_pf_body   in  varchar2,
+                       p_per_id    in  varchar2,
+                       p_ofcr_req  in  varchar2,
+                       p_remark    in  varchar2,
+                       p_exit_code out number  ) is
+
+    v_char      varchar2(200);
+    v_per_id    varchar2(20);
+    v_remark    varchar2(500);
+    v_body      varchar2(20);
+    v_fileno    varchar2(40);
+    v_status    varchar2(1);
+    v_officer   varchar2(20);
+
+begin
+
+    p_exit_code := 0;
+
+    lock table FTS_MASTER in exclusive mode; -- lock FTS_MASTER table (in case a record needs to be created)
+
+    v_per_id := p_per_id;
+    v_remark := p_remark;
+
+    --validate mandatory parameters
+    v_char := null;
+    if p_pf_type is not null
+   and p_pf_body is not null then
+
+       begin
+           select PER_ID
+             into v_char
+             from FTS_MASTER
+            where PF_TYPE = p_pf_type
+              and PF_BODY = p_pf_body;
+
+            if p_per_id is null then
+                v_per_id := v_char;
+            else
+                if v_per_id <> v_char then
+                    p_exit_code := 6;
+                    rollback;
+                    return;
+                end if;
+            end if;
+
+       exception
+
+            when no_data_found then
+                p_exit_code := 4;
+                rollback;
+                return;
+
+            when others then
+                p_exit_code := 101;
+				PENSION.DEBUG('FTS.New_Request 101'||SQLERRM);
+                rollback;
+                return;
+       end;
+
+
+   end if; -- p_pf_type and p_pf_body are both not null
+
+
+    if p_pf_type  is null
+    or p_ofcr_req is null then
+        p_exit_code := 8;
+        rollback;
+        return;
+    end if;    --PF type or username are null
+
+    if  p_pf_body is null
+    and p_per_id  is null then
+       p_exit_code := 8;
+       rollback;
+       return;
+    end if;     --p_pf_body and p_per_id are both null
+
+
+
+    begin -- check if PER_ID exists in PER_PERSON / PER_PERSON_INCOMPLETE
+
+        select PER_ID
+          into v_char
+          from PER_PERSON
+         where PER_ID = v_per_id;
+
+    exception
+
+        when no_data_found then
+
+            begin
+                p_exit_code := 2;
+                select PER_ID
+                  into v_char
+                  from PER_PERSON_INCOMPLETE
+                 where PER_ID = v_per_id;
+
+            exception
+
+                when no_data_found then
+                
+                    begin
+                        p_exit_code := 0;
+                        select PER_FIM_ID
+                          into v_char
+                          from PER_DETAILS
+                         where PER_FIM_ID = v_per_id;
+        
+                    exception
+        
+                        when no_data_found then
+                        p_exit_code := 3;
+                        rollback;
+                        return;
+        
+                        when others then
+                        p_exit_code := 109;
+						PENSION.DEBUG('FTS.Transfer_File 109'||SQLERRM);
+                        rollback;
+                        return;
+        
+                    end;
+
+                when others then
+                p_exit_code := 102;
+				PENSION.DEBUG('FTS.New_Request 102'||SQLERRM);
+                rollback;
+                return;
+
+            end;
+
+        when others then
+                p_exit_code := 103;
+				PENSION.DEBUG('FTS.New_Request 103'||SQLERRM);
+                rollback;
+                return;
+
+    end; --check PER_ID
+    
+    begin
+        select PF_BODY
+          into v_body
+          from FTS_MASTER
+         where PF_TYPE = p_pf_type
+           and PER_ID = v_per_id;
+    exception
+    
+        when no_data_found then
+            null;
+    
+        when others then
+            p_exit_code := 108;
+			PENSION.DEBUG('FTS.New_Request 108'||SQLERRM);
+    end;
+    
+    -- check if user already has a request in queue
+    if Req_In_Queue( p_pf_type, v_body, p_ofcr_req ) then
+
+        p_exit_code := 5;
+        rollback;
+        return;
+
+    end if;
+    
+    -- check if user already has an active request in FTS_REQUESTS (status N, A, T, L, R )
+    if Req_Exist( p_pf_type, v_body, p_ofcr_req ) then
+
+        p_exit_code := 5;
+        rollback;
+        return;
+
+    end if;
+    -- *********** end of verifications
+
+    if p_exit_code = 2 then
+        v_fileno := Get_File_No (p_pf_type, v_per_id, 'PER_PERSON_INCOMPLETE');
+        if  v_fileno is null
+        and false then--and p_pf_type <> 'PFRF' then
+            p_exit_code := 7;
+            rollback;
+            return;
+
+        else
+            v_remark := '*** PERSON IS IN INCOMPLETE RECORDS ***' || chr(10) || 'FILE NO. (OLD FORMAT): ' || v_fileno
+                        || chr(10) || chr(10) ||p_remark;
+        end if;
+    else
+        v_fileno := Get_File_No (p_pf_type, v_per_id, 'PER_PERSON');
+        if  v_fileno is null
+        and false then--and p_pf_type <> 'PFRF' then
+            p_exit_code := 7;
+            rollback;
+            return;
+        end if;
+    end if;
+
+    if p_pf_body is not null then
+
+        declare
+
+            v_officer      varchar2(20);
+            v_section      varchar2(20);
+            v_since        date;
+            v_exit_code    number;
+
+        begin -- check if PF number exists in MASTER
+            select PF_TYPE
+              into v_char
+              from FTS_MASTER
+             where PF_TYPE = p_pf_type
+               and PF_BODY = p_pf_body;
+
+            v_status := Get_Req_Status( p_pf_type, p_pf_body );
+
+            case
+                when v_status = 'O' or v_status = 'C' then
+                    Get_File_Location ( p_pf_type, p_pf_body, v_officer, v_section, v_since, v_exit_code);
+                    insert
+                      into FTS_REQUESTS
+                           (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                    values (p_pf_type, p_pf_body, sysdate, 'N',p_ofcr_req, Get_User_Section(p_ofcr_req),v_officer , v_section, v_remark, p_ofcr_req);
+                    commit;
+
+                when v_status = 'I' or v_status is null then
+                    insert
+                      into FTS_REQUESTS
+                           (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                    values (p_pf_type, p_pf_body, sysdate, 'N',p_ofcr_req, Get_User_Section(p_ofcr_req),NULL , v_registry_sec, v_remark, p_ofcr_req);
+                    commit;
+
+                else
+                    insert
+                      into FTS_REQ_QUEUE
+                           (PF_TYPE, PF_BODY, ACT_TIME, FROM_USER, FROM_SECT, REQ_REMARK)
+                    values (p_pf_type, p_pf_body, sysdate, p_ofcr_req, Get_User_Section(p_ofcr_req), v_remark);
+                    commit;
+
+            end case;
+
+
+        exception
+
+            when no_data_found then
+                p_exit_code := 4;
+                rollback;
+                return;
+
+            when others then
+                p_exit_code := 104;
+                rollback;
+                return;
+
+        end;
+
+    else
+
+        declare
+
+            v_officer      varchar2(20);
+            v_section      varchar2(20);
+            v_since        date;
+            v_exit_code    number;
+
+        begin
+
+            select PF_BODY
+              into v_body
+              from FTS_MASTER
+             where PF_TYPE = p_pf_type
+               and PER_ID = v_per_id;
+
+        v_status := Get_Req_Status( p_pf_type, v_body );
+
+        case
+            when v_status = 'O' or v_status = 'C' then
+                Get_File_Location ( p_pf_type, v_body, v_officer, v_section, v_since, v_exit_code);
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, v_body, sysdate, 'N',p_ofcr_req, Get_User_Section(p_ofcr_req),v_officer , v_section, v_remark, p_ofcr_req);
+                commit;
+
+            when v_status = 'I' or v_status is null then
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, v_body, sysdate, 'N',p_ofcr_req, Get_User_Section(p_ofcr_req),NULL , v_registry_sec, v_remark, p_ofcr_req);
+                commit;
+
+            else
+                insert
+                  into FTS_REQ_QUEUE
+                       (PF_TYPE, PF_BODY, ACT_TIME, FROM_USER, FROM_SECT, REQ_REMARK)
+                values (p_pf_type, v_body, sysdate, p_ofcr_req, Get_User_Section(p_ofcr_req), v_remark);
+                commit;
+
+        end case;
+
+        exception
+
+            when no_data_found then
+
+                begin
+
+                    v_body := PF_Body_Gen(p_pf_type);
+
+                    --  when there is no record in FTS_MASTER then we assume the file is in Registry. So create a new record in FTS_MASTER and open request with status N
+					insert into FTS_MASTER
+					   (PF_TYPE, PF_BODY, PER_ID,PF_CUSER,PF_CDATE)
+					values (p_pf_type, v_body , v_per_id,USER,SYSDATE);
+
+                    insert
+                      into FTS_STATUS
+                           (PF_TYPE, PF_BODY, PF_STATUS, AMEND_TIME, AMEND_BY, STATUS_REM )
+                    values (p_pf_type, v_body, 'A', sysdate, 'SYSTEM', null);
+
+                    insert
+                      into FTS_REQUESTS
+                           (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                    values (p_pf_type, v_body, sysdate, 'N',p_ofcr_req, Get_User_Section(p_ofcr_req), NULL, v_registry_sec, v_remark, p_ofcr_req);
+                    commit;
+
+                exception
+                    when others then
+                    p_exit_code := 105;
+                    rollback;
+                    return;
+
+                end;
+
+            when others then
+                p_exit_code := 106;
+                rollback;
+                return;
+        end;
+
+    end if;
+    rollback;
+
+exception
+    when others then
+        p_exit_code := 107;
+		PENSION.DEBUG('FTS.New_Request 107'||SQLERRM);
+        rollback;
+        return;
+
+end New_Request;
+
+
+------------------------------ Get_Req_Status --------------------
+function Get_Req_Status  ( p_pf_type IN varchar2,
+                           p_pf_body IN varchar2 )
+return varchar2 is
+
+    v_status  varchar2(1);
+
+begin
+
+
+    select TRANS_STATUS
+      into v_status
+      from FTS_REQUESTS
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body
+       and ACT_TIME = (select MAX(ACT_TIME)
+                         from FTS_REQUESTS
+                        where PF_TYPE = p_pf_type
+                          and PF_BODY = p_pf_body);
+
+    return v_status;
+
+exception
+
+    when no_data_found then
+        return null;
+
+end Get_Req_Status;
+
+------------------------------ Num_Of_New_Req --------------------
+FUNCTION NUM_OF_NEW_REQ(P_OPTION IN VARCHAR2, P_VALUE IN VARCHAR2)
+RETURN NUMBER IS
+	V_NUM NUMBER;
+BEGIN
+/*
+	IF P_OPTION = 'U' THEN
+		BEGIN
+			SELECT 
+				COUNT(*)
+			INTO V_NUM
+			FROM 
+				FTS_REQUESTS REQ 
+			WHERE
+				REQ.TRANS_STATUS ='N' AND REQ.TO_USER = P_VALUE
+			AND 
+				REQ.PF_TYPE||REQ.PF_BODY||TO_CHAR(ACT_TIME,'DD-MON-YYYY HH24:MI:SS') IN (
+				SELECT 
+					PF_TYPE||PF_BODY||TO_CHAR(MAX(ACT_TIME),'DD-MON-YYYY HH24:MI:SS')
+				FROM FTS_REQUESTS REQ 
+				GROUP BY PF_TYPE||PF_BODY
+				);
+			RETURN V_NUM;
+		EXCEPTION
+			WHEN NO_DATA_FOUND THEN RETURN 0;
+		END;
+	ELSIF P_OPTION = 'S' THEN
+		BEGIN
+			SELECT 
+				COUNT(*)
+			INTO V_NUM
+			FROM 
+				FTS_REQUESTS REQ 
+			WHERE
+				REQ.TRANS_STATUS ='N' AND REQ.TO_SECT = P_VALUE
+			AND 
+				REQ.PF_TYPE||REQ.PF_BODY||TO_CHAR(ACT_TIME,'DD-MON-YYYY HH24:MI:SS') IN (
+				SELECT 
+					PF_TYPE||PF_BODY||TO_CHAR(MAX(ACT_TIME),'DD-MON-YYYY HH24:MI:SS')
+				FROM FTS_REQUESTS REQ 
+				GROUP BY PF_TYPE||PF_BODY
+				);
+			RETURN V_NUM;
+		EXCEPTION 
+			WHEN NO_DATA_FOUND THEN RETURN 0;
+		END;
+	ELSE 
+		RETURN 0;
+	END IF;*/
+RETURN 10;
+END NUM_OF_NEW_REQ;	
+
+/*
+------------------------------ Ack_Req --------------------
+ * Exit codes:
+ * 0 - Updated successfuly
+ * 1 - Current request status IS NOT 'New Request'
+ * 2 - User has no privileges to perform action
+ * 3 - File not found
+*/
+procedure   Ack_Req                 (p_pf_type   in  varchar2,
+                                     p_pf_body   in  varchar2,
+                                     p_username  in  varchar2,
+                                     p_exit_code out number   ) is
+
+    v_char      varchar2(500);
+    v_status    varchar2(2);
+    v_from_u    varchar2(20);
+    v_from_s    varchar2(20);
+    v_to_u      varchar2(20);
+    v_to_s      varchar2(20);
+    v_rem       varchar2(500);
+
+begin
+
+    select PF_TYPE
+    into v_char
+    from FTS_MASTER
+    where PF_TYPE = p_pf_type
+    and PF_BODY = p_pf_body
+   FOR UPDATE OF PF_TYPE;  -- lock record on FTP_MASTER
+
+    select TRANS_STATUS,
+           FROM_USER,
+           FROM_SECT,
+           TO_USER,
+           TO_SECT,
+           REQ_REMARK
+      into v_status,
+           v_from_u,
+           v_from_s,
+           v_to_u,
+           v_to_s,
+           v_rem
+      from FTS_REQUESTS
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body
+       and ACT_TIME = (select MAX(ACT_TIME)
+                         from FTS_REQUESTS
+                        where PF_TYPE = p_pf_type
+                          and PF_BODY = p_pf_body);
+
+
+    if v_status = 'N' then
+
+        if  v_to_u = p_username
+        or  ( Get_User_Section(p_username) = v_to_s
+              and
+              Get_User_Function(p_username) in ('M_TLDR','M_MNGR'))
+        or  ( Get_User_Section(p_username) = v_registry_sec
+              and
+              v_to_s = v_registry_sec)
+        then
+
+            begin
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, sysdate, 'A',v_from_u, v_from_s, v_to_u, v_to_s, v_rem ,p_username);
+                commit;
+                p_exit_code := 0;
+                return;
+            end;
+
+        else
+
+            p_exit_code := 2;
+            rollback;
+            return;
+
+        end if;
+
+
+    else
+
+        p_exit_code := 1;
+        rollback;
+        return;
+
+    end if;
+
+    rollback;
+
+exception
+
+    when no_data_found then
+        p_exit_code := 3;
+        rollback;
+        return;
+
+end Ack_Req;
+
+/*
+------------------------------ Reject_Req --------------------
+ * Exit codes:
+ * 0 - Updated successfuly
+ * 1 - Remark is longer than 500 chars
+ * 2 - File not found
+ * 3 - Status is not N or A
+ * 4 - User has no privileges to perform action
+*/
+procedure   Reject_Req              (p_pf_type   in  varchar2,
+                                     p_pf_body   in  varchar2,
+                                     p_username  in  varchar2,
+                                     p_remark    in  varchar2,
+                                     p_exit_code out number   ) is
+
+    v_char      varchar2(500);
+    v_status    varchar2(2);
+    v_from_u    varchar2(20);
+    v_from_s    varchar2(20);
+    v_to_u      varchar2(20);
+    v_to_s      varchar2(20);
+
+begin
+
+    select PF_TYPE
+    into v_char
+    from FTS_MASTER
+    where PF_TYPE = p_pf_type
+    and PF_BODY = p_pf_body
+    FOR UPDATE OF PF_TYPE;  -- lock record on FTP_MASTER
+
+    if length( p_remark ) > 500 then  /* remark too long */
+        p_exit_code := 1;
+        rollback;
+        return;
+    end if;
+
+    select TRANS_STATUS,
+           FROM_USER,
+           FROM_SECT,
+           TO_USER,
+           TO_SECT
+      into v_status,
+           v_from_u,
+           v_from_s,
+           v_to_u,
+           v_to_s
+      from FTS_REQUESTS
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body
+       and ACT_TIME = (select MAX(ACT_TIME)
+                         from FTS_REQUESTS
+                        where PF_TYPE = p_pf_type
+                          and PF_BODY = p_pf_body);
+
+
+    if v_status not in ('N', 'A') then  /* status not NEW or ACKNOWLEDGED */
+        p_exit_code := 3;
+        rollback;
+        return;
+    end if;
+
+    if  v_to_u = p_username
+    or  ( Get_User_Section(p_username) = v_to_s
+          and
+          Get_User_Function(p_username) in ('M_TLDR','M_MNGR'))
+    or  ( Get_User_Section(p_username) = v_registry_sec
+          and
+          v_to_s = v_registry_sec)
+    then
+        insert
+          into FTS_REQUESTS
+               (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+        values (p_pf_type, p_pf_body, sysdate, 'R',v_from_u, v_from_s, v_to_u, v_to_s, p_remark ,p_username);
+        commit;
+        p_exit_code := 0;
+
+    else
+
+        p_exit_code := 4;
+        rollback;
+        return;
+
+    end if;
+
+    rollback;
+
+exception
+
+    when no_data_found then
+        p_exit_code := 2;
+        rollback;
+        return;
+
+end Reject_Req;
+
+/*
+------------------------------ Cancel_Req --------------------
+ * Exit codes:
+ * 0 - Updated successfuly
+ * 1 - Remark is longer than 500 chars
+ * 2 - Request not found in Queue
+ * 3 - Status is not N or A or R
+ * 4 - User has no privileges to perform action
+*/
+procedure   Cancel_Req              (p_pf_type   in  varchar2,
+                                     p_pf_body   in  varchar2,
+                                     p_from_u    in  varchar2,
+                                     p_status    in  varchar2,
+                                     p_username  in  varchar2,
+                                     p_remark    in  varchar2,
+                                     p_exit_code out number   ) is
+
+    v_char          varchar2(500);
+    v_status        varchar2(2);
+    v_from_u        varchar2(20);
+    v_from_s        varchar2(20);
+    v_to_u          varchar2(20);
+    v_to_s          varchar2(20);
+    v_from_u_q      varchar2(20);
+    v_from_s_q      varchar2(20);
+    v_req_remark_q  varchar2(500);
+    v_officer       varchar2(50);
+    v_section       varchar2(20);
+    v_since         date;
+    v_act_time_q    date;
+    v_now           date  := sysdate;
+    v_exit_code     number;
+
+begin
+
+    -- check length of remark
+    if length( p_remark ) > 500 then
+        p_exit_code := 1;
+        rollback;
+        return;
+    end if;
+
+    -- lock record on FTP_MASTER
+    select PF_TYPE
+      into v_char
+      from FTS_MASTER
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body
+       for update of PF_TYPE;
+
+    if p_status <> 'IN QUEUE' then
+
+        begin
+
+            select TRANS_STATUS,
+                   FROM_USER,
+                   FROM_SECT,
+                   TO_USER,
+                   TO_SECT
+              into v_status,
+                   v_from_u,
+                   v_from_s,
+                   v_to_u,
+                   v_to_s
+              from FTS_REQUESTS
+             where PF_TYPE = p_pf_type
+               and PF_BODY = p_pf_body
+               and ACT_TIME = (select MAX(ACT_TIME)
+                                 from FTS_REQUESTS
+                                where PF_TYPE = p_pf_type
+                                  and PF_BODY = p_pf_body);
+
+            if v_status not in ('N', 'A', 'R')
+            and not (Get_User_Section(p_username) = v_registry_sec -- manager of registry section can cancel ANY request !
+                     and
+                     Get_User_Function(p_username) = 'M_MNGR') then  /* status not NEW or ACKNOWLEDGED or REJECTED */
+                p_exit_code := 3;
+                rollback;
+                return;
+            end if;
+
+            --check privileges
+            if  (v_from_u = p_username
+                and v_from_s = Get_User_Section(p_username))
+            or  ( v_from_s = Get_User_Section(p_username)
+                  and
+                  Get_User_Function(p_username) in ('M_TLDR','M_MNGR'))
+            or  (Get_User_Section(p_username) = v_registry_sec
+                 and
+                 v_from_s = v_registry_sec)
+            or  (Get_User_Section(p_username) = v_registry_sec -- manager of registry section can cancel ANY request !
+                 and
+                 Get_User_Function(p_username) = 'M_MNGR')
+            then
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, sysdate, 'C',v_from_u, v_from_s, v_to_u, v_to_s, p_remark ,p_username);
+
+                v_now := sysdate + DBMS_RANDOM.VALUE(1,60)/86400 ;  -- add random fraction to prevent primary key conflict
+
+                Handle_Queue( p_pf_type, p_pf_body, v_now, p_exit_code );
+
+                if p_exit_code in (0, 202) then -- 202: no record in queue
+                    commit;
+                    p_exit_code := 0;
+                else
+                    rollback;
+                end if;
+
+                return;
+
+            else  -- no privileges
+
+                rollback;
+                p_exit_code := 4;
+                return;
+
+            end if;  --privileges
+
+            rollback;
+
+        exception
+
+            when no_data_found then
+
+                    rollback;
+                    p_exit_code := 103;
+                    return;
+
+            when others then
+
+                rollback;
+                p_exit_code := 104;
+                return;
+
+        end;  --status is not 'IN QUEUE'
+
+    else  -- status is 'IN QUEUE'
+
+        begin
+
+            select  FROM_USER,
+                    FROM_SECT,
+                    ACT_TIME,
+                    REQ_REMARK
+              into  v_from_u_q,
+                    v_from_s_q,
+                    v_act_time_q,
+                    v_req_remark_q
+              from  FTS_REQ_QUEUE
+             where  PF_TYPE   = p_pf_type
+               and  PF_BODY   = p_pf_body
+               and  FROM_USER = p_from_u;
+
+            insert
+              into  FTS_REQ_QUEUE_HIST
+                    (PF_TYPE,PF_BODY,START_TIME,FROM_USER,FROM_SECT,REQ_REMARK,END_TIME)
+            values (p_pf_type, p_pf_body, v_act_time_q, v_from_u_q, v_from_s_q, v_req_remark_q, v_now);
+
+            delete
+              from  FTS_REQ_QUEUE
+             where  PF_TYPE   = p_pf_type
+               and  PF_BODY   = p_pf_body
+               and  FROM_USER = v_from_u_q;
+
+            commit;
+            p_exit_code := 0;
+            return;
+
+        exception
+
+            when no_data_found then
+                rollback;
+                p_exit_code := 2;
+                return;
+
+            when others then
+                rollback;
+                p_exit_code := 105;
+                return;
+
+        end;
+
+    end if;
+
+    p_exit_code := 0;
+    commit;
+
+exception
+
+    when others then
+
+        rollback;
+        p_exit_code := 106;
+        return;
+
+end Cancel_Req;
+
+/*
+------------------------------ Transfer_File --------------------
+ * Exit codes:
+ * 0 - Updated successfuly
+ * 1 - Remark is longer than 500 chars
+ * 2 - File is already in registry
+ * 3 - File is already in transit
+ * 4 - User has no privileges to perform action
+ * 5 - File is already at its destination
+ * 6 - File is in a rejected request status
+ * 7 - Request and transfer destinations do not match
+ * 8 - File status is not ACTIVE
+ * 9 - The signer has no privileges to receive the file
+*/
+
+procedure   Transfer_File  (p_pf_type      in  varchar2,
+                            p_pf_body      in  varchar2,
+                            p_sender       in  varchar2,
+                            p_esigner      in  varchar2, -- if p_esigner is not null then the file will be checked-out/in
+                            p_from_u       in  varchar2,
+                            p_from_s       in  varchar2,
+                            p_remark       in  varchar2,
+                            p_exit_code    out number   ) is
+
+    v_char          varchar2(500);
+    v_dummy         varchar2(20);
+    v_req_status    FTS_REQUESTS.TRANS_STATUS%type;
+    v_from_u        FTS_REQUESTS.FROM_USER%type;
+    v_from_s        FTS_REQUESTS.FROM_SECT%type;
+    v_to_u          FTS_REQUESTS.TO_USER%type;
+    v_to_s          FTS_REQUESTS.TO_SECT%type;
+    v_from_u_q      FTS_REQ_QUEUE.FROM_USER%type;
+    v_from_s_q      FTS_REQ_QUEUE.FROM_SECT%type;
+    v_act_time_q    FTS_REQ_QUEUE.ACT_TIME%type;
+    v_req_remark_q  FTS_REQ_QUEUE.REQ_REMARK%type;
+    v_officer       varchar2(50);
+    v_sender_sect   varchar2(20);
+    v_sender_func   varchar2(6);
+    v_loc_ofcr      varchar2(50);
+    v_loc_sect      varchar2(20);
+    v_file_status   varchar2(1);
+    v_loc_since     date;
+    v_now           date := sysdate;
+    v_exit_code     number;
+
+begin
+
+    -- check length of remark
+    if length( p_remark ) > 500 then
+        p_exit_code := 1;
+        rollback;
+        return;
+    end if;
+
+    -- lock record in FTS_MASTER
+    select PF_TYPE
+      into v_dummy
+      from FTS_MASTER
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body
+       for update of PF_TYPE;
+
+    v_sender_func   := Get_User_Function( p_sender );
+    v_sender_sect   := Get_User_Section ( p_sender );
+
+    Get_File_Location( p_pf_type, p_pf_body, v_loc_ofcr, v_loc_sect, v_loc_since, v_exit_code );
+
+
+    --Check if file is already at its destination
+    if  v_loc_ofcr =  p_from_u
+    and v_loc_sect =  p_from_s then
+
+        p_exit_code := 5;
+        rollback;
+        return;
+
+    end if;
+
+    --Check if the person who signed can receive the file
+    if  p_esigner is not null then
+
+        if p_from_u = p_esigner
+        or (p_from_s = Get_User_Section ( p_esigner )
+            and
+            Get_User_Function( p_esigner ) in ('M_TLDR','M_MNGR') )
+        or (p_from_s = v_registry_sec
+            and
+            Get_User_Section( p_esigner ) = v_registry_sec ) then
+
+            null;
+
+        else
+
+            p_exit_code := 9;
+            rollback;
+            return;
+
+        end if;
+    end if;
+
+
+    -- Check if file is already in registry
+    if  v_loc_sect  = v_registry_sec
+    and p_from_s = v_registry_sec then
+
+        p_exit_code := 2;
+        rollback;
+        return;
+
+    end if;
+
+    -- Check current file status
+    begin
+        select  PF_STATUS
+          into  v_file_status
+          from  FTS_STATUS
+         where  PF_TYPE = p_pf_type
+           and  PF_BODY = p_pf_body
+           and  AMEND_TIME = (select MAX(AMEND_TIME)
+                                from FTS_STATUS
+                               where PF_TYPE = p_pf_type
+                                 and PF_BODY = p_pf_body);
+
+        if v_file_status <> 'A' then    -- File status is not Active
+
+            p_exit_code := 8;
+            rollback;
+            return;
+
+        end if;
+
+    exception
+
+        when no_data_found then
+            p_exit_code := 8;
+            rollback;
+            return;
+    end;
+
+
+    -- Check current request status
+    begin
+        select  TRANS_STATUS,
+                FROM_USER,
+                FROM_SECT,
+                TO_USER,
+                TO_SECT
+          into  v_req_status,
+                v_from_u,
+                v_from_s,
+                v_to_u,
+                v_to_s
+          from  FTS_REQUESTS
+         where  PF_TYPE = p_pf_type
+           and  PF_BODY = p_pf_body
+           and  ACT_TIME = (select MAX(ACT_TIME)
+                              from FTS_REQUESTS
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body);
+     exception
+
+        when no_data_found then
+
+            v_req_status := null;
+            v_from_u     := null;
+            v_from_s     := null;
+            v_to_u       := null;
+            v_to_s       := null;
+
+        when others then
+
+            p_exit_code := 107;
+			PENSION.DEBUG('FTS.Transfer_File 107'||SQLERRM);
+            rollback;
+            return;
+
+     end;
+
+
+    if  v_req_status = 'T'
+    and p_esigner is null then   -- file is already in transit
+        p_exit_code := 3;
+        rollback;
+        return;
+    end if;
+    /*      This section was marked out because of logic change:
+            Transferring the file while in Reject mode,
+            will OVERRIDE the rejection. {AC}
+    if v_status = 'R' then   -- file is in a rejected request status
+        p_exit_code := 6;
+        rollback;
+        return;
+    end if;
+    */
+    if  v_req_status = 'L' then
+        if  v_from_s = v_sender_sect
+        and v_sender_func in ('M_TLDR','M_MNGR') then   -- Only team leader or manager of relevant section can transfer this file
+            if p_esigner is null then
+                begin
+                    insert
+                      into FTS_REQUESTS
+                           (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                    values (p_pf_type, p_pf_body, v_now, 'T',p_from_u, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+
+                    commit;
+                    p_exit_code := 0;
+                    return;
+                exception
+                    when others then
+                        p_exit_code := 103;
+                        rollback;
+                        return;
+                end;
+            else
+                begin
+                    insert
+                      into FTS_REQUESTS
+                           (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                    values (p_pf_type, p_pf_body, v_now, 'O',p_from_u, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+
+                    insert
+                      into FTS_TRANS
+                           (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                    values (p_pf_type, p_pf_body, v_now, p_esigner, Get_User_Section(p_esigner));
+
+                    p_exit_code := 0;
+
+                    v_now := sysdate + DBMS_RANDOM.VALUE(1,50)/86400 + DBMS_RANDOM.VALUE(51,100)/86400 ;  -- add random fraction to prevent primary key conflict
+
+                    Handle_Queue( p_pf_type, p_pf_body, v_now, p_exit_code );
+
+                    if p_exit_code in (0, 202) then -- 202: no record in queue
+                        commit;
+                        p_exit_code := 0;
+                    else
+                        rollback;
+                    end if;
+
+                    return;
+
+                exception
+                    when others then
+                        p_exit_code := 109;
+						PENSION.DEBUG('FTS.Transfer_File 109'||SQLERRM);
+                        rollback;
+                        return;
+                end;
+            end if;
+        else
+            p_exit_code := 4;
+            rollback;
+            return;
+        end if;
+    end if;
+
+    if v_req_status is null
+    or v_req_status in ( 'I', 'O', 'C' ) then
+
+        if  (v_loc_ofcr = p_sender
+            and
+             v_loc_sect = v_sender_sect)
+        or (v_loc_sect = v_sender_sect
+            and
+            v_sender_func in ('M_TLDR','M_MNGR'))
+        or (v_loc_sect  = v_registry_sec
+            and
+            v_sender_sect = v_registry_sec) then
+
+                begin
+
+                    if p_esigner is null then
+                        insert
+                          into FTS_REQUESTS
+                               (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                        values (p_pf_type, p_pf_body, v_now, 'T',p_from_u, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+
+                        commit;
+                        p_exit_code := 0;
+
+                    else
+                        if p_esigner = p_from_u then
+                            if p_from_s = v_registry_sec then
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'I',p_from_u, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+                            else
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'O',p_from_u, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+                            end if;
+
+                            insert
+                              into FTS_TRANS
+                                   (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                            values (p_pf_type, p_pf_body, v_now, p_esigner, Get_User_Section(p_esigner));
+
+                            v_now := sysdate + DBMS_RANDOM.VALUE(1,50)/86400 + DBMS_RANDOM.VALUE(51,100)/86400 ;  -- add random fraction to prevent primary key conflict
+
+                            Handle_Queue( p_pf_type, p_pf_body, v_now, p_exit_code );
+
+                        elsif  p_from_u is not null
+                          and  Get_User_Section(p_esigner) = p_from_s
+                          and  Get_User_Function( p_esigner ) in ('M_TLDR','M_MNGR') then
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'L',p_from_u, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+
+                                insert
+                                  into FTS_TRANS
+                                       (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                                values (p_pf_type, p_pf_body, v_now, p_esigner, Get_User_Section(p_esigner));
+
+                                commit;
+                                p_exit_code := 0;
+
+                        elsif  p_from_u is null
+                          and  Get_User_Section ( p_esigner ) = p_from_s
+                          and  Get_User_Function( p_esigner ) in ('M_TLDR','M_MNGR') then
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'O',p_esigner, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+
+                                insert
+                                  into FTS_TRANS
+                                       (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                                values (p_pf_type, p_pf_body, v_now, p_esigner, Get_User_Section(p_esigner));
+
+                                v_now := sysdate + DBMS_RANDOM.VALUE(1,50)/86400 + DBMS_RANDOM.VALUE(51,100)/86400 ;  -- add random fraction to prevent primary key conflict
+
+                                Handle_Queue( p_pf_type, p_pf_body, v_now, p_exit_code );
+
+                        elsif  p_from_s = v_registry_sec
+                          and  Get_User_Section ( p_esigner ) = v_registry_sec then
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'I',p_esigner, p_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+
+                                insert
+                                  into FTS_TRANS
+                                       (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                                values (p_pf_type, p_pf_body, v_now, p_esigner, Get_User_Section(p_esigner));
+
+                                v_now := sysdate + DBMS_RANDOM.VALUE(1,50)/86400 + DBMS_RANDOM.VALUE(51,100)/86400 ;  -- add random fraction to prevent primary key conflict
+
+                                Handle_Queue( p_pf_type, p_pf_body, v_now, p_exit_code );
+                        end if;
+
+                    end if;
+
+                    if p_exit_code in (0, 202) then   -- 202: no record in queue
+                        commit;
+                        p_exit_code := 0;
+                    else
+                        rollback;
+                    end if;
+
+                    return;
+
+                exception
+                    when others then
+                        p_exit_code := 108;
+                        rollback;
+                        return;
+                end;
+        else  -- user has no privilege to transfer file
+
+            p_exit_code := 4;
+            rollback;
+            return;
+
+        end if;
+
+    end if;
+
+    -- find the earliest record in FTS_REQ_QUEUE
+    begin
+
+        select  FROM_USER,
+                FROM_SECT,
+                ACT_TIME,
+                REQ_REMARK
+          into  v_from_u_q,
+                v_from_s_q,
+                v_act_time_q,
+                v_req_remark_q
+          from  FTS_REQ_QUEUE
+         where  PF_TYPE = p_pf_type
+           and  PF_BODY = p_pf_body
+           and  ACT_TIME = (select MIN(ACT_TIME)
+                              from FTS_REQ_QUEUE
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body);
+
+    exception
+
+        when no_data_found then
+            v_from_u_q     := NULL;
+            v_from_s_q     := NULL;
+            v_act_time_q   := NULL;
+            v_req_remark_q := NULL;
+
+    end;
+
+
+    if v_req_status in ( 'N', 'A', 'R' )
+    or (v_req_status = 'T'
+       and
+       p_esigner is not null) then
+
+        if  (p_from_s is not null and p_from_u is null) then
+
+             if (v_from_u is null and v_from_s is not null) then
+                if p_from_s <> v_from_s then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+             if (v_from_u is not null and v_from_s is null) then
+                if p_from_s <> Get_User_Section(v_from_u) then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+             if (v_from_u is not null and v_from_s is not null) then
+                if p_from_s <> v_from_s then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+
+        end if;
+
+        if  (p_from_s is null and p_from_u is not null) then
+
+             if (v_from_u is null and v_from_s is not null) then
+                if Get_User_Section(p_from_u) <> v_from_s then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+             if (v_from_u is not null and v_from_s is null) then
+                if p_from_u <> v_from_u then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+             if (v_from_u is not null and v_from_s is not null) then
+                if (p_from_u <> v_from_u) or (Get_User_Section(v_from_u) <> v_from_s) then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+
+        end if;
+
+        if  (p_from_s is not null and p_from_u is not null) then
+
+             if (v_from_u is null and v_from_s is not null) then
+                if (Get_User_Section(p_from_u) <> p_from_s) or (p_from_s <> v_from_s) then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+             if (v_from_u is not null and v_from_s is null) then
+                if (Get_User_Section(p_from_u) <> p_from_s) or (p_from_u <> v_from_u) then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+             if (v_from_u is not null and v_from_s is not null) then
+                if (p_from_u <> v_from_u)
+                    or
+                   (Get_User_Section(v_from_u) <> v_from_s)
+                   or
+                   (p_from_s <> v_from_s)
+                   or
+                   (Get_User_Section(p_from_u) <> p_from_s)
+                   then
+                    p_exit_code := 7;
+                    rollback;
+                    return;
+                end if;
+             end if;
+        end if;
+
+
+        if (v_to_u = p_sender
+            and
+            v_to_s = v_sender_sect)
+        or (v_to_s = v_sender_sect
+            and
+            v_sender_func in ('M_TLDR','M_MNGR'))
+        or (v_to_s = v_registry_sec
+            and
+            v_sender_sect = v_registry_sec) then
+
+                begin
+                    if p_esigner is null then
+                        insert
+                          into FTS_REQUESTS
+                               (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                        values (p_pf_type, p_pf_body, v_now, 'T',v_from_u, v_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+                    else
+                        if p_esigner = v_from_u then
+                            if v_from_s = v_registry_sec then
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'I',v_from_u, v_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+                            else
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'O',v_from_u, v_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+                            end if;
+
+                            insert
+                              into FTS_TRANS
+                                   (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                            values (p_pf_type, p_pf_body, v_now, p_esigner, Get_User_Section(p_esigner));
+
+                            if v_act_time_q is not null then
+
+                                ---- handle request queue:
+
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now + DBMS_RANDOM.VALUE(1,50)/86400 + DBMS_RANDOM.VALUE(51,100)/86400, 'N',v_from_u_q, v_from_s_q, p_esigner , Get_User_Section(p_esigner), v_req_remark_q, v_from_u_q);
+                                -- add random fraction to prevent primary key conflict ^
+                                insert
+                                  into FTS_REQ_QUEUE_HIST
+                                       (PF_TYPE,PF_BODY,START_TIME,FROM_USER,FROM_SECT,REQ_REMARK,END_TIME)
+                                values (p_pf_type, p_pf_body, v_act_time_q, v_from_u_q, v_from_s_q, v_req_remark_q, v_now);
+
+                                delete
+                                  from FTS_REQ_QUEUE
+                                 where PF_TYPE   = p_pf_type
+                                   and PF_BODY   = p_pf_body
+                                   and FROM_USER = v_from_u_q;
+                            end if;
+
+
+                        else
+                            if  Get_User_Section(p_esigner) = v_from_s
+                            and Get_User_Function( p_esigner ) in ('M_TLDR','M_MNGR') then
+                                insert
+                                  into FTS_REQUESTS
+                                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                                values (p_pf_type, p_pf_body, v_now, 'L',v_from_u, v_from_s, p_sender , v_sender_sect, p_remark, p_sender);
+
+                                insert
+                                  into FTS_TRANS
+                                       (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                                values (p_pf_type, p_pf_body, v_now, p_esigner, Get_User_Section(p_esigner));
+
+                            end if;
+
+                        end if;
+
+                    end if;
+
+                    commit;
+                    p_exit_code := 0;
+                    return;
+
+                exception
+                    when others then
+                        p_exit_code := 104;
+                        rollback;
+                        return;
+                end;
+        else  --user has no privilege to transfer file
+
+            p_exit_code := 4;
+            rollback;
+            return;
+
+        end if;
+
+    end if;
+
+exception
+
+    when others then
+
+        p_exit_code := 101;
+        rollback;
+        return;
+
+p_exit_code := 105;
+rollback;
+
+end Transfer_File;
+
+/*
+------------------------------ Receive_File --------------------
+ * Exit codes:
+ * 0 - Updated successfuly
+ * 1 - File status is NOT 'in transit'
+ * 2 - User has no privileges to perform action
+ * 3 - User is already handling this file
+ * 4 - File is already at the Registry section
+ 
+ 09/02/2021 K.K. ALLOWED RECEIVING A FILE BY ANYONE FROM THE REGISTRY SECTION AS PER THE CUSTOMER REQUEST
+*/
+
+procedure   Receive_File   (p_pf_type      in  varchar2,
+                            p_pf_body      in  varchar2,
+                            p_username     in  varchar2,
+                            p_exit_code    out number   ) is
+
+    v_dummy         varchar2(20);
+    v_status        FTS_REQUESTS.TRANS_STATUS%type;
+    v_from_u        FTS_REQUESTS.FROM_USER%type;
+    v_from_s        FTS_REQUESTS.FROM_SECT%type;
+    v_to_u          FTS_REQUESTS.TO_USER%type;
+    v_to_s          FTS_REQUESTS.TO_SECT%type;
+    v_now           date := sysdate;
+    v_officer    USERS.USERNAME%type;
+    v_section    USERS.SEC_CODE%type;
+    v_since      date;
+    v_exit_code  number;
+
+begin
+
+    -- lock record in FTS_MASTER
+    select PF_TYPE
+      into v_dummy
+      from FTS_MASTER
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body
+       for update of PF_TYPE;
+
+    begin -- Check if user is already handling the file
+          -- Check the latest request status. Only 'T','L'(for team leaders) statuses can be recieved
+
+        Get_File_Location( p_pf_type, p_pf_body, v_officer, v_section, v_since, v_exit_code );
+
+        select  TRANS_STATUS,
+                FROM_USER,
+                FROM_SECT,
+                TO_USER,
+                TO_SECT
+        into    v_status,
+                v_from_u,
+                v_from_s,
+                v_to_u,
+                v_to_s
+        from    FTS_REQUESTS
+       where    PF_TYPE = p_pf_type
+         and    PF_BODY = p_pf_body
+         and    ACT_TIME = (select MAX(ACT_TIME)
+                              from FTS_REQUESTS
+                             where PF_TYPE = p_pf_type
+                               and PF_BODY = p_pf_body);
+
+        if  v_status = 'L' then     -- Requests in status 'L' can be turn into 'O' by a team leader or manager
+
+            if  (Get_User_Section( p_username ) = v_section 
+            and Get_User_Function( p_username ) in ('M_TLDR','M_MNGR')) OR Get_User_Section( p_username ) = v_registry_sec then
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, v_now, 'O',v_from_u, v_from_s, v_to_u , v_to_s, null, p_username);
+
+                insert
+                  into FTS_TRANS
+                       (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                values (p_pf_type, p_pf_body, v_now, p_username, Get_User_Section(p_username));
+
+                v_now := sysdate + DBMS_RANDOM.VALUE(1,50)/86400 + DBMS_RANDOM.VALUE(51,100)/86400 ;  -- add random fraction to prevent primary key conflict
+
+                Handle_Queue( p_pf_type, p_pf_body, v_now, p_exit_code );
+
+                if p_exit_code in (0, 202) then -- 202: no record in queue
+                    commit;
+                    p_exit_code := 0;
+                    return;
+                else
+                    rollback;
+                    return;
+                end if;
+
+            else
+
+                p_exit_code := 2;
+                rollback;
+                return;
+
+            end if;
+
+        end if; -- v_status = 'L'
+
+
+        if v_status <> 'T' then
+          if Get_User_Section( p_username ) = v_registry_sec then
+            v_status :='T';
+          else
+            p_exit_code := 1;
+            rollback;
+            return;
+          end if;
+        end if;
+
+
+        if  v_officer = p_username    -- Check if user already handling this file
+        and Get_User_Section( p_username ) <> v_registry_sec then
+            p_exit_code := 3;
+            rollback;
+            return;
+        end if;
+
+        /*
+        if  v_section = v_registry_sec
+        and Get_User_Section( p_username ) = v_registry_sec then
+            p_exit_code := 4;
+            rollback;
+            return;
+        end if;
+        */
+    exception
+
+        when no_data_found then
+            p_exit_code := 1;
+            rollback;
+            return;
+
+        when others then
+            p_exit_code := 102;
+            rollback;
+            return;
+
+    end;  --Check request status and location
+
+        if p_username = v_from_u then
+
+            if Get_User_Section( p_username ) = v_registry_sec then
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, v_now, 'I',v_from_u, v_from_s, v_to_u , v_to_s, null, p_username);
+
+            else
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, v_now, 'O',v_from_u, v_from_s, v_to_u , v_to_s, null, p_username);
+
+            end if;
+
+        elsif   (Get_User_Section( p_username ) = v_from_s
+                 and
+                 Get_User_Function(p_username) in ('M_TLDR','M_MNGR'))
+               or
+                (v_from_s = v_registry_sec
+                 and
+                 Get_User_Section( p_username ) = v_from_s ) 
+               or (Get_User_Section( p_username ) = v_registry_sec) then
+
+            if Get_User_Section( p_username ) = v_registry_sec then
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, v_now, 'I',v_from_u, v_from_s, v_to_u , v_to_s, null, p_username);
+
+            else
+
+                insert
+                  into FTS_REQUESTS
+                       (PF_TYPE, PF_BODY, ACT_TIME, TRANS_STATUS, FROM_USER, FROM_SECT, TO_USER, TO_SECT, REQ_REMARK, AMEND_BY)
+                values (p_pf_type, p_pf_body, v_now, 'L',v_from_u, v_from_s, v_to_u , v_to_s, null, p_username);
+
+                insert
+                  into FTS_TRANS
+                       (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+                values (p_pf_type, p_pf_body, v_now, p_username, Get_User_Section(p_username));
+
+                commit;
+                p_exit_code := 0;
+                return;
+
+            end if;
+
+        else
+
+            p_exit_code := 2; -- user has no privileges to recieve the file
+            rollback;
+            return;
+
+        end if;
+
+        insert
+          into FTS_TRANS
+               (PF_TYPE, PF_BODY, RCVD_TIME, OFCR_RCVD, SECT_RCVD)
+        values (p_pf_type, p_pf_body, v_now, p_username, Get_User_Section(p_username));
+
+        v_now := sysdate + DBMS_RANDOM.VALUE(1,50)/86400 + DBMS_RANDOM.VALUE(51,100)/86400 ;  -- add random fraction to prevent primary key conflict
+
+        Handle_Queue( p_pf_type, p_pf_body, v_now, p_exit_code );
+
+        if p_exit_code in (0, 202) then -- 202: no record in queue
+            commit;
+            p_exit_code := 0;
+        else
+            rollback;
+        end if;
+
+exception
+
+    when others then
+        p_exit_code := 101;
+        rollback;
+        return;
+
+end Receive_File;
+
+
+/*
+------------------------------ Chg_File_Status --------------------
+ * Exit codes:
+ * 0 - Updated successfuly
+ * 1 - File is not in Registry
+ * 2 - User has no privileges to perform action
+ * 3 - PF number does not exist
+ * 4 - Status code does not exist
+ * 5 - The new status is not different than the current one
+ * 6 - Unknown error
+ * 7 - Remark longer than 500 chararcters
+ * 8 - There is an open request for that file
+*/
+
+function   Chg_File_Status (p_pf_type      in  varchar2,
+                            p_pf_body      in  varchar2,
+                            p_status       in  varchar2,
+                            p_username     in  varchar2,
+                            p_remark       in  varchar2)
+return number is
+
+    v_file_status       varchar2(1);
+    v_req_status        varchar2(1) := Get_Req_Status( p_pf_type, p_pf_body );
+    v_char              varchar2(20);
+
+begin
+
+    -- check length of remark
+    if length( p_remark ) > 500 then
+        return 7;
+    end if;
+
+    if not PF_Num_Exist( p_pf_type, p_pf_body ) then
+        return 3;
+    elsif Get_User_Section( p_username ) <> v_registry_sec then
+        return 2;
+    elsif p_status not in ('A','D','M','R','I','O') then
+        return 4;
+    elsif v_req_status not in ('O','I','C') then
+        return 8;
+    end if;
+
+    --lock table FTS_STATUS in exclusive mode;  <- replaced by locking row on FTS_MASTER
+    select  PF_TYPE
+      into  v_char
+      from  FTS_MASTER
+     where  PF_TYPE = p_pf_type
+       and  PF_BODY = p_pf_body
+       FOR  UPDATE OF PF_TYPE;  -- lock record on FTP_MASTER
+
+    select RFS.PF_STATUS
+      into v_file_status
+      from FTS_STATUS STS,
+           REF_FTS_FILE_STATUS RFS
+     where PF_TYPE = p_pf_type
+       and PF_BODY = p_pf_body
+       and STS.PF_STATUS = RFS.PF_STATUS
+       and AMEND_TIME = (select MAX(AMEND_TIME)
+                           from FTS_STATUS
+                          where PF_TYPE = p_pf_type
+                            and PF_BODY = p_pf_body)
+        for update of STS.PF_STATUS;
+
+    if v_file_status = p_status then
+        rollback;
+        return 5;
+    end if;
+
+    declare
+        v_officer    varchar2(20);
+        v_section    varchar2(20);
+        v_since      date;
+        v_exit_code  number;
+
+    begin
+
+        Get_File_Location   (p_pf_type, p_pf_body, v_officer, v_section, v_since, v_exit_code);
+
+        if v_section <> v_registry_sec then
+            rollback;
+            return 1;
+        end if;
+
+    exception
+        when others then
+            rollback;
+            return sqlcode;
+
+    end;
+
+    insert
+      into FTS_STATUS
+           (PF_TYPE, PF_BODY, PF_STATUS, AMEND_TIME, AMEND_BY, STATUS_REM )
+    values (p_pf_type, p_pf_body, p_status, sysdate, p_username, p_remark);
+
+    commit;
+
+    return 0;
+
+exception
+
+    when no_data_found then
+        rollback;
+        return sqlcode;
+
+    when others then
+        rollback;
+        return sqlcode;
+
+end Chg_File_Status;
+
+
+------------------------------ Next_Trans --------------------
+
+function Next_Trans (p_pf_type   in varchar2,
+                     p_pf_body   in varchar2,
+                     p_rcvd_time in date    ) 
+return date is
+                     
+next_date   date;
+
+begin 
+
+    select min(rcvd_time)
+      into next_date
+      from fts_trans
+     where pf_type = p_pf_type
+       and pf_body = p_pf_body
+       and rcvd_time > p_rcvd_time;
+
+return next_date;
+       
+exception
+
+    when no_data_found then
+        return null;
+
+end Next_Trans;
+
+end FTS;
